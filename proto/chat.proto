@@ -1,0 +1,13 @@
+syntax = "proto3";
+
+package chat;
+option go_package = "anuwat.com/grpc-realtime-chat/pb";
+
+message ChatMessage {
+  string sender = 1;
+  string message = 2;
+}
+
+service ChatService {
+  rpc ChatStream (stream ChatMessage) returns (stream ChatMessage);
+}
