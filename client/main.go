@@ -18,6 +18,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 )
 
+// Constants for UI configuration
 const (
 	gap        = "\n\n"
 	serverAddr = "localhost:50051"
@@ -27,66 +28,96 @@ const (
 	vpHeight   = 5
 )
 
-type model struct {
-	viewport    viewport.Model
-	messages    []string
-	textarea    textarea.Model
-	senderStyle lipgloss.Style
-	username    string
-	client      pb.ChatServiceClient
-	stream      pb.ChatService_ChatStreamClient
-	err         error
+// ChatClient wraps the gRPC client and stream
+type ChatClient struct {
+	client pb.ChatServiceClient
+	stream pb.ChatService_ChatStreamClient
+	conn   *grpc.ClientConn
 }
 
-type errMsg error
-
-type messageReceivedMsg struct {
-	sender  string
-	message string
-}
-
-func main() {
-	username := getUserInput("Enter your name: ")
-
-	client, stream, err := setupGRPCConnection()
-	if err != nil {
-		log.Fatalf("Failed to setup gRPC connection: %v", err)
-	}
-
-	m := initialModel(username, client, stream)
-	p := tea.NewProgram(m, tea.WithAltScreen())
-
-	// Start listening for messages
-	go m.listenForMessages(p)
-
-	if _, err := p.Run(); err != nil {
-		log.Fatalf("Error running program: %v", err)
-	}
-}
-
-func getUserInput(prompt string) string {
-	reader := bufio.NewReader(os.Stdin)
-	fmt.Print(prompt)
-	input, _ := reader.ReadString('\n')
-	return strings.TrimSpace(input)
-}
-
-func setupGRPCConnection() (pb.ChatServiceClient, pb.ChatService_ChatStreamClient, error) {
+// NewChatClient creates a new chat client with gRPC connection
+func NewChatClient(serverAddr string) (*ChatClient, error) {
 	conn, err := grpc.Dial(serverAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to dial server: %w", err)
+		return nil, fmt.Errorf("failed to dial server: %w", err)
 	}
 
 	client := pb.NewChatServiceClient(conn)
 	stream, err := client.ChatStream(context.Background())
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to create stream: %w", err)
+		conn.Close()
+		return nil, fmt.Errorf("failed to create stream: %w", err)
 	}
 
-	return client, stream, nil
+	return &ChatClient{
+		client: client,
+		stream: stream,
+		conn:   conn,
+	}, nil
 }
 
-func initialModel(username string, client pb.ChatServiceClient, stream pb.ChatService_ChatStreamClient) model {
+// Close closes the gRPC connection
+func (c *ChatClient) Close() error {
+	if c.conn != nil {
+		return c.conn.Close()
+	}
+	return nil
+}
+
+// SendMessage sends a message through the gRPC stream
+func (c *ChatClient) SendMessage(sender, message string) error {
+	if strings.TrimSpace(message) == "" {
+		return nil
+	}
+
+	return c.stream.Send(&pb.ChatMessage{
+		Sender:  sender,
+		Message: message,
+	})
+}
+
+// ReceiveMessages listens for incoming messages and sends them to the program
+func (c *ChatClient) ReceiveMessages(p *tea.Program) {
+	for {
+		msg, err := c.stream.Recv()
+		if err == io.EOF {
+			log.Println("Server closed connection")
+			p.Send(ConnectionClosedMsg{})
+			return
+		}
+		if err != nil {
+			log.Printf("Error receiving message: %v", err)
+			p.Send(ErrorMsg{err})
+			return
+		}
+
+		p.Send(MessageReceivedMsg{
+			Sender:  msg.Sender,
+			Message: msg.Message,
+		})
+	}
+}
+
+// Message types for the Bubble Tea program
+type (
+	ErrorMsg            struct{ error }
+	MessageReceivedMsg  struct{ Sender, Message string }
+	ConnectionClosedMsg struct{}
+)
+
+// Model represents the application state
+type Model struct {
+	viewport    viewport.Model
+	messages    []string
+	textarea    textarea.Model
+	senderStyle lipgloss.Style
+	username    string
+	chatClient  *ChatClient
+	err         error
+}
+
+// NewModel creates a new model with the given username and chat client
+func NewModel(username string, chatClient *ChatClient) Model {
 	ta := textarea.New()
 	ta.Placeholder = "Send a message..."
 	ta.Focus()
@@ -101,54 +132,24 @@ func initialModel(username string, client pb.ChatServiceClient, stream pb.ChatSe
 	vp := viewport.New(width, vpHeight)
 	vp.SetContent("Welcome to the chat room!\nType a message and press Enter to send.")
 
-	return model{
+	return Model{
 		textarea:    ta,
 		messages:    []string{},
 		viewport:    vp,
 		senderStyle: lipgloss.NewStyle().Foreground(lipgloss.Color("5")),
 		username:    username,
-		client:      client,
-		stream:      stream,
+		chatClient:  chatClient,
 		err:         nil,
 	}
 }
 
-func (m model) listenForMessages(p *tea.Program) {
-	for {
-		msg, err := m.stream.Recv()
-		if err == io.EOF {
-			log.Println("Server closed connection")
-			return
-		}
-		if err != nil {
-			log.Printf("Error receiving message: %v", err)
-			p.Send(errMsg(err))
-			return
-		}
-
-		p.Send(messageReceivedMsg{
-			sender:  msg.Sender,
-			message: msg.Message,
-		})
-	}
-}
-
-func (m model) sendMessage(message string) error {
-	if strings.TrimSpace(message) == "" {
-		return nil
-	}
-
-	return m.stream.Send(&pb.ChatMessage{
-		Sender:  m.username,
-		Message: message,
-	})
-}
-
-func (m model) Init() tea.Cmd {
+// Init implements tea.Model
+func (m Model) Init() tea.Cmd {
 	return textarea.Blink
 }
 
-func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+// Update implements tea.Model
+func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var (
 		tiCmd tea.Cmd
 		vpCmd tea.Cmd
@@ -159,42 +160,63 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
-		m.viewport.Width = msg.Width
-		m.textarea.SetWidth(msg.Width)
-		m.viewport.Height = msg.Height - m.textarea.Height() - lipgloss.Height(gap)
-		m.updateViewportContent()
+		m.handleWindowResize(msg)
 
 	case tea.KeyMsg:
-		switch msg.Type {
-		case tea.KeyCtrlC, tea.KeyEsc:
-			return m, tea.Quit
-		case tea.KeyEnter:
-			if err := m.sendMessage(m.textarea.Value()); err != nil {
-				m.err = err
-			} else {
-				m.addMessage("You", m.textarea.Value())
-				m.textarea.Reset()
-			}
+		cmd := m.handleKeyPress(msg)
+		if cmd != nil {
+			return m, cmd
 		}
 
-	case messageReceivedMsg:
-		m.addMessage(msg.sender, msg.message)
+	case MessageReceivedMsg:
+		m.addMessage(msg.Sender, msg.Message)
 
-	case errMsg:
-		m.err = msg
+	case ErrorMsg:
+		m.err = msg.error
+		return m, tea.Quit
+
+	case ConnectionClosedMsg:
+		m.err = fmt.Errorf("connection closed by server")
 		return m, tea.Quit
 	}
 
 	return m, tea.Batch(tiCmd, vpCmd)
 }
 
-func (m *model) addMessage(sender, message string) {
+// handleWindowResize handles window resize events
+func (m *Model) handleWindowResize(msg tea.WindowSizeMsg) {
+	m.viewport.Width = msg.Width
+	m.textarea.SetWidth(msg.Width)
+	m.viewport.Height = msg.Height - m.textarea.Height() - lipgloss.Height(gap)
+	m.updateViewportContent()
+}
+
+// handleKeyPress handles key press events
+func (m *Model) handleKeyPress(msg tea.KeyMsg) tea.Cmd {
+	switch msg.Type {
+	case tea.KeyCtrlC, tea.KeyEsc:
+		return tea.Quit
+	case tea.KeyEnter:
+		message := m.textarea.Value()
+		if err := m.chatClient.SendMessage(m.username, message); err != nil {
+			m.err = err
+		} else {
+			m.addMessage("You", message)
+			m.textarea.Reset()
+		}
+	}
+	return nil
+}
+
+// addMessage adds a new message to the chat
+func (m *Model) addMessage(sender, message string) {
 	formattedMsg := m.senderStyle.Render(sender+": ") + message
 	m.messages = append(m.messages, formattedMsg)
 	m.updateViewportContent()
 }
 
-func (m *model) updateViewportContent() {
+// updateViewportContent updates the viewport with the latest messages
+func (m *Model) updateViewportContent() {
 	if len(m.messages) > 0 {
 		content := strings.Join(m.messages, "\n")
 		m.viewport.SetContent(lipgloss.NewStyle().Width(m.viewport.Width).Render(content))
@@ -202,7 +224,8 @@ func (m *model) updateViewportContent() {
 	m.viewport.GotoBottom()
 }
 
-func (m model) View() string {
+// View implements tea.Model
+func (m Model) View() string {
 	if m.err != nil {
 		return fmt.Sprintf("Error: %v\nPress any key to exit.", m.err)
 	}
@@ -213,4 +236,35 @@ func (m model) View() string {
 		gap,
 		m.textarea.View(),
 	)
+}
+
+// getUserInput prompts the user for input and returns the trimmed string
+func getUserInput(prompt string) string {
+	reader := bufio.NewReader(os.Stdin)
+	fmt.Print(prompt)
+	input, _ := reader.ReadString('\n')
+	return strings.TrimSpace(input)
+}
+
+func main() {
+	username := getUserInput("Enter your name: ")
+	if username == "" {
+		log.Fatal("Username cannot be empty")
+	}
+
+	chatClient, err := NewChatClient(serverAddr)
+	if err != nil {
+		log.Fatalf("Failed to create chat client: %v", err)
+	}
+	defer chatClient.Close()
+
+	model := NewModel(username, chatClient)
+	program := tea.NewProgram(model, tea.WithAltScreen())
+
+	// Start listening for messages in a goroutine
+	go chatClient.ReceiveMessages(program)
+
+	if _, err := program.Run(); err != nil {
+		log.Fatalf("Error running program: %v", err)
+	}
 }
